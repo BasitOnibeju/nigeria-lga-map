@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Nigeria LGAs — Stroke-only boundaries (Leaflet)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    html,body,#map{height:100%;margin:0;padding:0}
+    #info{
+      position:absolute;left:8px;bottom:8px;background:#fff;padding:8px;border-radius:6px;z-index:1000;
+      box-shadow:0 2px 8px rgba(0,0,0,0.12);font-family:system-ui,Segoe UI,Roboto,Arial;
+    }
+    .lga-label {
+      font-size:12px;
+      font-weight:600;
+      color:#111;
+      text-shadow:0 1px 1px rgba(255,255,255,0.85);
+      pointer-events:none;
+      background: rgba(255,255,255,0.0);
+      padding: 2px 4px;
+      border-radius: 3px;
+      white-space: nowrap;
+    }
+    @media (max-width:420px){ .lga-label{font-size:11px} #info{font-size:12px} }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="info">Pan & zoom — LGAs load for visible area. Zoom ≥ 9 to show labels.</div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+  // ---------- CONFIG ----------
+  const API_BASE = ''; // '' = same origin; if serving frontend separately set "http://localhost:3000"
+  const SAMPLE_GEOJSON_FALLBACK = 'data/sample.geojson';
+  const DEFAULT_TOL = 0.0005;      // ST_Simplify tolerance sent to server
+  const MIN_ZOOM_FOR_LABELS = 9;   // show LGA labels at this zoom or higher
+  const MAX_FEATURES_RETURNED = 2000;
+  // ----------------------------
+
+  // create map
+  const map = L.map('map', {preferCanvas: false}).setView([9.0820, 8.6753], 6);
+
+  // crisp basemap (Carto Voyager) with retina support
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+    maxZoom: 19,
+    detectRetina: true
+  }).addTo(map);
+
+  // use explicit SVG renderer for crisp joins
+  const svgRenderer = L.svg({padding: 0.5});
+
+  // helper utils
+  function escapeHtml(str){ if(!str) return ''; return String(str).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"}[c])); }
+  function colorByState(s){ if(!s) return '#ddd'; let h=0; for(let i=0;i<s.length;i++) h = s.charCodeAt(i) + ((h<<5)-h); return `hsl(${Math.abs(h)%360} 60% 58%)`; }
+
+  // adaptive border weight by zoom — tweak values to taste
+  function getBorderWeight(){
+    const z = map.getZoom();
+    if (z <= 6) return 1;
+    if (z <= 8) return 1.5;
+    if (z <= 10) return 2.5;
+    if (z <= 12) return 3.5;
+    return 4.5;
+  }
+
+  // LGA vector layer — stroke only, no fill
+  const lgaLayer = L.geoJSON(null, {
+    renderer: svgRenderer,
+    style: feature => ({
+      color: '#2b5fdb',          // default border color
+      weight: getBorderWeight(),
+      opacity: 1,
+      fillOpacity: 0,            // fully transparent interior
+      lineJoin: 'round',
+      lineCap: 'round'
+    }),
+    onEachFeature: (feature, layer) => {
+      layer.on({
+        mouseover: e => {
+          const target = e.target;
+          target.setStyle({
+            weight: Math.max(3, getBorderWeight() + 1),
+            color: '#ff5722',   // hover highlight
+            opacity: 1
+          });
+          if (target.bringToFront) try { target.bringToFront(); } catch(e){}
+        },
+        mouseout: e => {
+          lgaLayer.resetStyle(e.target);
+        },
+        click: e => {
+          // highlight selected (no fill)
+          if (selectedLayer) lgaLayer.resetStyle(selectedLayer);
+          selectedLayer = e.target;
+          selectedLayer.setStyle({ weight: getBorderWeight() + 2, color: '#0b8043' });
+          const p = feature.properties || {};
+          const lga = p.name_2 || p.lga_name || 'Unknown';
+          const state = p.name_1 || p.state_name || '';
+          const html = `<strong>${escapeHtml(lga)}</strong><br/><small>${escapeHtml(state)}</small>`;
+          L.popup().setLatLng(e.latlng).setContent(html).openOn(map);
+          document.getElementById('info').textContent = `${lga} — ${state}`;
+        }
+      });
+    }
+  }).addTo(map);
+
+  let selectedLayer = null;
+  let labelLayers = [];
+  const cache = new Map(); // bbox string -> geojson
+
+  // compute centroid (cheap) for polygon/multipolygon: average of first ring coords
+  function computeCentroid(feature){
+    try {
+      const geom = feature.geometry;
+      if(!geom) return null;
+      if(geom.type === 'Polygon'){
+        return avgLngLat(geom.coordinates[0]);
+      } else if(geom.type === 'MultiPolygon'){
+        // choose largest polygon by ring length
+        let best = geom.coordinates[0];
+        let bestLen = best[0].length;
+        for(let i=1;i<geom.coordinates.length;i++){
+          if(geom.coordinates[i][0].length > bestLen){ best = geom.coordinates[i]; bestLen = best[0].length; }
+        }
+        return avgLngLat(best[0]);
+      } else if(geom.type === 'Point'){
+        return { lat: geom.coordinates[1], lng: geom.coordinates[0] };
+      } else {
+        return null;
+      }
+    } catch(e){ return null; }
+  }
+  function avgLngLat(ring){
+    let sx=0, sy=0, n=0;
+    for(let i=0;i<ring.length;i++){ sx += ring[i][1]; sy += ring[i][0]; n++; }
+    if(n===0) return null;
+    return { lat: sx/n, lng: sy/n };
+  }
+
+  function clearLabels(){
+    labelLayers.forEach(m => map.removeLayer(m));
+    labelLayers = [];
+  }
+
+  function addLabelsFromGeojson(geojson){
+    clearLabels();
+    if(map.getZoom() < MIN_ZOOM_FOR_LABELS) return;
+    if(!geojson || !geojson.features) return;
+    for(const f of geojson.features){
+      const props = f.properties || {};
+      const name = props.name_2 || props.lga_name || '';
+      if(!name) continue;
+      const c = computeCentroid(f);
+      if(!c) continue;
+      const icon = L.divIcon({ className: 'lga-label', html: escapeHtml(name) });
+      const marker = L.marker([c.lat, c.lng], { icon, interactive: false }).addTo(map);
+      labelLayers.push(marker);
+    }
+  }
+
+  // get bbox string as minLng,minLat,maxLng,maxLat
+  function getBboxString(){
+    const b = map.getBounds();
+    if(!b) return null;
+    const sw = b.getSouthWest(), ne = b.getNorthEast();
+    return `${sw.lng},${sw.lat},${ne.lng},${ne.lat}`;
+  }
+
+  // fetch visible features from server (cached)
+  async function fetchVisible(){
+    const bbox = getBboxString();
+    if(!bbox) return;
+    if(cache.has(bbox)){ onGeojsonLoaded(cache.get(bbox)); return; }
+    const url = `${API_BASE}/api/lgas?bbox=${bbox}&tol=${DEFAULT_TOL}`;
+    try {
+      const res = await fetch(url);
+      if(!res.ok) throw new Error('API ' + res.status);
+      const geojson = await res.json();
+      cache.set(bbox, geojson);
+      onGeojsonLoaded(geojson);
+    } catch(err){
+      console.warn('API failed, falling back to sample.geojson', err);
+      // fallback local sample
+      try {
+        const r = await fetch(SAMPLE_GEOJSON_FALLBACK);
+        const geojson = await r.json();
+        cache.set(bbox, geojson);
+        onGeojsonLoaded(geojson);
+      } catch(e){
+        console.error('Fallback failed', e);
+        document.getElementById('info').textContent = 'Map data failed to load.';
+      }
+    }
+  }
+
+  function onGeojsonLoaded(geojson){
+    // clear selected highlight
+    if (selectedLayer) { lgaLayer.resetStyle(selectedLayer); selectedLayer = null; }
+    lgaLayer.clearLayers();
+    lgaLayer.addData(geojson);
+    addLabelsFromGeojson(geojson);
+  }
+
+  // debounce fetch on moveend
+  let tid = null;
+  map.on('moveend', () => { clearTimeout(tid); tid = setTimeout(fetchVisible, 220); });
+
+  // update border thickness & labels on zoom change
+  map.on('zoomend', () => {
+    lgaLayer.setStyle(function(feature){ return {
+      color: '#2b5fdb', weight: getBorderWeight(), opacity: 1, fillOpacity: 0
+    };});
+    // rebuild labels from last cached geojson (if any)
+    const last = Array.from(cache.values()).pop();
+    if(last) addLabelsFromGeojson(last);
+  });
+
+  // initial load
+  fetchVisible();
+
+  // small debug helper
+  window._mapCache = cache;
+
+  // Expose a manual reload helper for dev
+  window.reloadLGAs = () => fetchVisible();
+
+  </script>
+</body>
+</html>
