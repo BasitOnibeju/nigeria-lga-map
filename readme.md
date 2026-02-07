@@ -1,6 +1,6 @@
 # 🇳🇬 Nigeria LGA Interactive Map
 
-Interactive web map displaying **all 774+ Local Government Areas in Nigeria with accurate boundaries using **PostGIS, Node.js, and Leaflet.
+Interactive web map displaying all 774+ Local Government Areas in Nigeria with accurate boundaries using PostGIS, Node.js, and Leaflet.
 
 ## 🚀 Features
 - Accurate LGA boundaries
